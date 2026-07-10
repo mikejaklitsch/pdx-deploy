@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Deploy a Paradox dev mod to its game-readable location.
+
+Auto-detects the mod root via .metadata/, reads the deploy name from
+metadata.json (stripping " (Dev)"), and copies game directories to the
+deploy root (the parent of .dev-mods/).
+
+Usage:
+    pdx-deploy                  # deploy current directory
+    pdx-deploy /path/to/mod     # deploy specific mod
+    pdx-deploy --no-lint        # skip lint checks
+"""
+
+import importlib
+import importlib.util
+import json
+import shutil
+import sys
+from pathlib import Path
+
+MOD_DIRS = [".metadata", "in_game", "loading_screen", "main_menu"]
+SKIP_EXTENSIONS = {".md"}
+
+
+def find_mod_root(start=None):
+    p = (start or Path.cwd()).resolve()
+    while True:
+        if (p / ".metadata").is_dir():
+            return p
+        parent = p.parent
+        if parent == p:
+            break
+        p = parent
+    return None
+
+
+def find_deploy_root(mod_root):
+    """Walk up from mod_root looking for a parent named .dev-mods."""
+    p = mod_root
+    while True:
+        if p.parent.name == ".dev-mods":
+            return p.parent.parent
+        parent = p.parent
+        if parent == p:
+            break
+        p = parent
+    return None
+
+
+def get_deploy_name(mod_root):
+    meta_file = mod_root / ".metadata" / "metadata.json"
+    if not meta_file.exists():
+        return None
+    raw = meta_file.read_text(encoding="utf-8-sig")
+    meta = json.loads(raw)
+    name = meta.get("name", "")
+    if not name:
+        return None
+    return name.replace(" (Dev)", "")
+
+
+def run_lint(src):
+    lint_dir = src / "tools" / "lint"
+    if not lint_dir.is_dir():
+        return True
+    try:
+        tools_dir = str(src / "tools")
+        if tools_dir not in sys.path:
+            sys.path.insert(0, tools_dir)
+        import lint
+        importlib.reload(lint)
+        results = lint.run_all(src)
+        if tools_dir in sys.path:
+            sys.path.remove(tools_dir)
+    except Exception as e:
+        print(f"  LINT ERROR: {e}")
+        return True
+    if not results:
+        print(f"  Lint: all checks passed")
+        return True
+    total = 0
+    for name, errors in sorted(results.items()):
+        print(f"  LINT [{name}] ({len(errors)} issue{'s' if len(errors) != 1 else ''})")
+        for err in errors:
+            print(f"    {err}")
+        total += len(errors)
+    print(f"  Lint: {total} issue{'s' if total != 1 else ''} found")
+    return False
+
+
+def deploy(mod_root, skip_lint=False):
+    deploy_root = find_deploy_root(mod_root)
+    if not deploy_root:
+        print(f"Error: could not find .dev-mods/ ancestor for {mod_root}")
+        print("The mod must be inside a .dev-mods/ directory.")
+        sys.exit(1)
+
+    name = get_deploy_name(mod_root)
+    if not name:
+        name = mod_root.name.removesuffix(" Development")
+
+    dst = deploy_root / name
+
+    print(f"Deploying: {name}")
+
+    if not skip_lint:
+        if not run_lint(mod_root):
+            print(f"  Deploy blocked by lint errors. Use --no-lint to skip.")
+            return None
+
+    fallback_name = mod_root.name.removesuffix(" Development")
+    fallback_dst = deploy_root / fallback_name
+    for old_dst in {dst, fallback_dst}:
+        if old_dst.exists():
+            shutil.rmtree(old_dst)
+            print(f"  Cleaned: {old_dst.name}/")
+
+    copied = []
+    def _ignore_internal(directory, contents):
+        return [c for c in contents if Path(c).suffix.lower() in SKIP_EXTENSIONS]
+
+    for d in MOD_DIRS:
+        src_dir = mod_root / d
+        if src_dir.exists():
+            shutil.copytree(src_dir, dst / d, ignore=_ignore_internal)
+            copied.append(d)
+
+    if not copied:
+        print(f"  WARNING: No game directories found in {mod_root}")
+        return None
+
+    print(f"  Copied: {', '.join(copied)}")
+
+    meta_file = dst / ".metadata" / "metadata.json"
+    meta = None
+    if meta_file.exists():
+        raw = meta_file.read_text(encoding="utf-8-sig")
+        meta = json.loads(raw)
+        if "(Dev)" in meta.get("name", ""):
+            meta["name"] = meta["name"].replace(" (Dev)", "")
+            meta_file.write_text(
+                json.dumps(meta, indent=4) + "\n", encoding="utf-8-sig"
+            )
+            print(f"  Stripped (Dev) from metadata name")
+
+    hook = mod_root / "tools" / "post_deploy.py"
+    if hook.exists():
+        spec = importlib.util.spec_from_file_location("post_deploy", hook)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        if hasattr(mod, "post_deploy"):
+            mod.post_deploy(mod_root, dst, meta)
+            print(f"  Ran post_deploy hook")
+
+    print(f"  Done: {dst}")
+    return dst
+
+
+def main():
+    args = sys.argv[1:]
+
+    if "-h" in args or "--help" in args:
+        print(__doc__.strip())
+        sys.exit(0)
+
+    skip_lint = "--no-lint" in args
+    args = [a for a in args if a != "--no-lint"]
+
+    if args:
+        mod_root = Path(args[0]).resolve()
+        if not (mod_root / ".metadata").is_dir():
+            print(f"Error: {mod_root} has no .metadata/ directory")
+            sys.exit(1)
+    else:
+        mod_root = find_mod_root()
+        if not mod_root:
+            print("Error: no .metadata/ found in current directory or parents")
+            sys.exit(1)
+
+    deploy(mod_root, skip_lint=skip_lint)
+
+
+if __name__ == "__main__":
+    main()
