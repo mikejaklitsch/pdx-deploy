@@ -9,17 +9,191 @@ Usage:
     pdx-deploy                  # deploy current directory
     pdx-deploy /path/to/mod     # deploy specific mod
     pdx-deploy --no-lint        # skip lint checks
+    pdx-deploy lock [path]      # block deploys; make dev game dirs read-only
+    pdx-deploy unlock [path]    # remove the lock and restore write access
+    pdx-deploy status [path]    # show lock state
 """
 
 import importlib
 import importlib.util
 import json
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 MOD_DIRS = [".metadata", "in_game", "loading_screen", "main_menu"]
 SKIP_EXTENSIONS = {".md"}
+LOCK_REGISTRY = Path(__file__).resolve().parent / ".deploy-locks.json"
+
+
+def load_locks():
+    if LOCK_REGISTRY.exists():
+        return json.loads(LOCK_REGISTRY.read_text(encoding="utf-8"))
+    return {}
+
+
+def save_locks(locks):
+    LOCK_REGISTRY.write_text(
+        json.dumps(locks, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def _win_tools():
+    icacls = shutil.which("icacls.exe")
+    wslpath = shutil.which("wslpath")
+    whoami = shutil.which("whoami.exe")
+    if icacls and wslpath and whoami:
+        return icacls, wslpath, whoami
+    return None
+
+
+def set_dev_write_protection(mod_root, protect):
+    """Deny (or restore) write and delete on the mod's game directories.
+
+    Uses a Windows deny ACL so writes are blocked from both Windows and
+    WSL. Returns True when every existing game directory was processed.
+    """
+    tools = _win_tools()
+    if not tools:
+        print("  WARNING: icacls not available; dev directories NOT write-protected.")
+        return False
+    icacls, wslpath, whoami = tools
+    user = subprocess.run([whoami], capture_output=True, text=True).stdout.strip()
+    if not user:
+        print("  WARNING: could not resolve Windows user; skipping write protection.")
+        return False
+    ok = True
+    for d in MOD_DIRS:
+        path = mod_root / d
+        if not path.exists():
+            continue
+        win_path = subprocess.run(
+            [wslpath, "-w", str(path)], capture_output=True, text=True
+        ).stdout.strip()
+        if protect:
+            cmd = [icacls, win_path, "/deny", f"{user}:(OI)(CI)(WD,AD,DC,DE)"]
+        else:
+            cmd = [icacls, win_path, "/remove:d", user]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"  WARNING: icacls failed on {d}: {result.stderr.strip()}")
+            ok = False
+    return ok
+
+
+def resolve_mod_root(args):
+    if args:
+        mod_root = Path(args[0]).resolve()
+        if not (mod_root / ".metadata").is_dir():
+            print(f"Error: {mod_root} has no .metadata/ directory")
+            sys.exit(1)
+        return mod_root
+    mod_root = find_mod_root()
+    if not mod_root:
+        print("Error: no .metadata/ found in current directory or parents")
+        sys.exit(1)
+    return mod_root
+
+
+def get_deploy_target(mod_root):
+    deploy_root = find_deploy_root(mod_root)
+    if not deploy_root:
+        return None
+    name = get_deploy_name(mod_root)
+    if not name:
+        name = mod_root.name.removesuffix(" Development")
+    return str((deploy_root / name).resolve())
+
+
+def cmd_lock(args):
+    mod_root = resolve_mod_root(args)
+    locks = load_locks()
+    src = str(mod_root)
+
+    if src in locks:
+        print(f"Already locked: {mod_root.name}")
+        if not locks[src].get("readonly"):
+            if set_dev_write_protection(mod_root, True):
+                locks[src]["readonly"] = True
+                save_locks(locks)
+                print(f"  Dev game directories are now read-only until unlocked.")
+        return
+
+    target = get_deploy_target(mod_root)
+    entry = {"target": target}
+    if set_dev_write_protection(mod_root, True):
+        entry["readonly"] = True
+    locks[src] = entry
+    save_locks(locks)
+
+    print(f"Locked: {mod_root.name}")
+    if target:
+        print(f"  Target: {target}")
+    print(f"  Deploys from or to this mod are blocked until unlocked.")
+    if entry.get("readonly"):
+        print(f"  Dev game directories are read-only until unlocked.")
+
+
+def cmd_unlock(args):
+    mod_root = resolve_mod_root(args)
+    locks = load_locks()
+    src = str(mod_root)
+
+    if src not in locks:
+        print(f"Not locked: {mod_root.name}")
+        return
+
+    if locks[src].get("readonly"):
+        if set_dev_write_protection(mod_root, False):
+            print(f"  Dev game directories are writable again.")
+
+    del locks[src]
+    save_locks(locks)
+    print(f"Unlocked: {mod_root.name}")
+
+
+def cmd_status(args):
+    mod_root = resolve_mod_root(args)
+    locks = load_locks()
+    src = str(mod_root)
+
+    if src in locks:
+        entry = locks[src]
+        print(f"LOCKED: {mod_root.name}")
+        if entry.get("target"):
+            print(f"  Target: {entry['target']}")
+        if entry.get("readonly"):
+            print(f"  Dev game directories are read-only.")
+    else:
+        print(f"Unlocked: {mod_root.name}")
+
+
+def check_locks(mod_root, dst):
+    locks = load_locks()
+    src = str(mod_root)
+    dst_str = str(dst.resolve())
+
+    if src in locks:
+        print(f"  DEPLOY BLOCKED: {mod_root.name} is locked.")
+        print(f"  The lock likely exists to prevent overwriting a deployed")
+        print(f"  directory that is ahead of this dev source, usually from")
+        print(f"  GUI editing done directly in the deployed mod.")
+        print(f"  Use 'pdx-deploy unlock' to remove the lock when ready.")
+        return False
+
+    for locked_src, entry in locks.items():
+        if entry.get("target") == dst_str and locked_src != src:
+            locked_name = Path(locked_src).name
+            print(f"  DEPLOY BLOCKED: target directory is locked by {locked_name}.")
+            print(f"  The lock likely exists to prevent overwriting a deployed")
+            print(f"  directory that is ahead of its dev source, usually from")
+            print(f"  GUI editing done directly in the deployed mod.")
+            print(f"  Unlock {locked_name} first with:")
+            print(f"    pdx-deploy unlock {locked_src}")
+            return False
+
+    return True
 
 
 def find_mod_root(start=None):
@@ -103,6 +277,9 @@ def deploy(mod_root, skip_lint=False):
 
     print(f"Deploying: {name}")
 
+    if not check_locks(mod_root, dst):
+        return None
+
     if not skip_lint:
         if not run_lint(mod_root):
             print(f"  Deploy blocked by lint errors. Use --no-lint to skip.")
@@ -163,20 +340,15 @@ def main():
         print(__doc__.strip())
         sys.exit(0)
 
+    subcommands = {"lock": cmd_lock, "unlock": cmd_unlock, "status": cmd_status}
+    if args and args[0] in subcommands:
+        subcommands[args[0]](args[1:])
+        return
+
     skip_lint = "--no-lint" in args
     args = [a for a in args if a != "--no-lint"]
 
-    if args:
-        mod_root = Path(args[0]).resolve()
-        if not (mod_root / ".metadata").is_dir():
-            print(f"Error: {mod_root} has no .metadata/ directory")
-            sys.exit(1)
-    else:
-        mod_root = find_mod_root()
-        if not mod_root:
-            print("Error: no .metadata/ found in current directory or parents")
-            sys.exit(1)
-
+    mod_root = resolve_mod_root(args)
     deploy(mod_root, skip_lint=skip_lint)
 
 
