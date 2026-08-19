@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdx-deploy"
+version = "1.0.0"
+description = "Deploy a Paradox dev mod to its game-readable location"
+requires-python = ">=3.10"
+
+[project.scripts]
+pdx-deploy = "pdx_deploy.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pdx_deploy*"]
