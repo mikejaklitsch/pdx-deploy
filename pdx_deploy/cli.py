@@ -1,16 +1,43 @@
-"""Deploy a Paradox dev mod to its game-readable location."""
+"""Deploy a Paradox dev mod to its game-readable location.
 
+Auto-detects the mod root via .metadata/, reads the deploy name from
+metadata.json (stripping " (Dev)"), and syncs game directories to the
+deploy root (the parent of .dev-mods/). Only changed files are copied.
+
+Usage:
+    pdx-deploy                  # deploy current directory
+    pdx-deploy /path/to/mod     # deploy specific mod
+    pdx-deploy --no-lint        # skip lint checks
+    pdx-deploy --full           # wipe the deployed mod and copy everything
+    pdx-deploy --exclude PAT    # leave out files matching PAT (repeatable)
+    pdx-deploy --exclude-from F # leave out the patterns in F, one per line
+    pdx-deploy lock [path]      # block deploys; make dev game dirs read-only
+    pdx-deploy unlock [path]    # remove the lock and restore write access
+    pdx-deploy status [path]    # show lock state
+
+An exclude pattern is a glob on the path relative to the mod root, such as
+in_game/common/on_action/* or main_menu/setup. A directory pattern covers
+everything under it. Excluded files are not copied, and their deployed
+copies are removed; the next deploy without the pattern restores them.
+"""
+
+import fnmatch
+import hashlib
 import importlib
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 MOD_DIRS = [".metadata", "in_game", "loading_screen", "main_menu"]
 SKIP_EXTENSIONS = {".md"}
 LOCK_REGISTRY = Path(__file__).resolve().parent.parent / ".deploy-locks.json"
+MANIFEST_DIR = Path.home() / ".cache" / "pdx-deploy" / "manifests"
+LIST_LIMIT = 20
 
 
 def load_locks():
@@ -248,7 +275,215 @@ def run_lint(src):
     return False
 
 
-def deploy(mod_root, skip_lint=False):
+METADATA_REL = ".metadata/metadata.json"
+
+
+def _stat_key(st):
+    return [st.st_size, st.st_mtime_ns]
+
+
+def manifest_path(dst):
+    digest = hashlib.sha1(str(dst.resolve()).encode("utf-8")).hexdigest()
+    return MANIFEST_DIR / f"{digest}.json"
+
+
+def load_manifest(mod_root, dst):
+    """Return {relpath: [src_size, src_mtime, dst_size, dst_mtime]} from the last deploy."""
+    path = manifest_path(dst)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if data.get("src") != str(mod_root):
+        return {}
+    return data.get("files", {})
+
+
+def save_manifest(mod_root, dst, files):
+    path = manifest_path(dst)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {"src": str(mod_root), "dst": str(dst.resolve()), "files": files}
+    path.write_text(json.dumps(data) + "\n", encoding="utf-8")
+
+
+def is_excluded(rel, excludes):
+    """True when rel matches a pattern, or lies under a directory pattern."""
+    for pat in excludes:
+        pat = pat.strip("/")
+        if fnmatch.fnmatchcase(rel, pat) or rel.startswith(pat + "/"):
+            return True
+    return False
+
+
+def scan_source(mod_root, src_dirs, excludes=()):
+    """Map each deployable file's relative path to its source stat."""
+    files = {}
+    for d in src_dirs:
+        for dirpath, _, filenames in os.walk(mod_root / d):
+            for f in filenames:
+                if Path(f).suffix.lower() in SKIP_EXTENSIONS:
+                    continue
+                full = Path(dirpath) / f
+                rel = full.relative_to(mod_root).as_posix()
+                if rel != METADATA_REL and not is_excluded(rel, excludes):
+                    files[rel] = full.stat()
+    return files
+
+
+def remove_stale(dst, keep):
+    """Delete anything under dst that the current source does not produce."""
+    removed = []
+    if not dst.is_dir():
+        return removed
+    for dirpath, dirnames, filenames in os.walk(dst, topdown=False):
+        base = Path(dirpath)
+        for f in filenames:
+            full = base / f
+            if full.relative_to(dst).as_posix() not in keep:
+                full.unlink()
+                removed.append(full.relative_to(dst).as_posix())
+        if base != dst and not any(base.iterdir()):
+            base.rmdir()
+    return removed
+
+
+def sync_python(mod_root, dst, src_dirs, full, excludes=()):
+    """Copy files whose source or deployed copy changed since the last deploy.
+
+    Fallback for when robocopy is unavailable. drvfs truncates copied
+    mtimes to whole seconds, so source and deployed stats cannot be
+    compared directly; a manifest records both sides after each deploy.
+    """
+    src_files = scan_source(mod_root, src_dirs, excludes)
+    manifest = {} if full else load_manifest(mod_root, dst)
+    removed = remove_stale(dst, set(src_files) | {METADATA_REL})
+    changed = []
+    for rel, src_st in src_files.items():
+        target = dst / rel
+        prev = manifest.get(rel)
+        if prev and prev[:2] == _stat_key(src_st):
+            try:
+                if prev[2:] == _stat_key(target.stat()):
+                    continue
+            except FileNotFoundError:
+                pass
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(mod_root / rel, target)
+        changed.append(rel)
+    save_manifest(mod_root, dst, {
+        rel: _stat_key(src_st) + _stat_key((dst / rel).stat())
+        for rel, src_st in src_files.items()
+    })
+    return changed, removed
+
+
+def _robocopy_tools(mod_root, dst):
+    """Return (robocopy, wslpath) when both paths live on a Windows drive."""
+    robocopy = shutil.which("robocopy.exe")
+    wslpath = shutil.which("wslpath")
+    if not (robocopy and wslpath):
+        return None
+    if not all(str(p).startswith("/mnt/") for p in (mod_root, dst)):
+        return None
+    return robocopy, wslpath
+
+
+def _win_path(wslpath, path):
+    return subprocess.run(
+        [wslpath, "-w", str(path)], capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def sync_robocopy(mod_root, dst, src_dirs, tools):
+    """Mirror each game directory with robocopy, which compares size and
+    timestamp natively on NTFS instead of stat-ing every file through drvfs."""
+    robocopy, wslpath = tools
+    changed, removed = [], []
+
+    dst.mkdir(parents=True, exist_ok=True)
+    for entry in dst.iterdir():
+        if entry.name not in src_dirs:
+            if entry.is_dir():
+                shutil.rmtree(entry)
+                removed.append(entry.name + "/")
+            else:
+                entry.unlink()
+                removed.append(entry.name)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "robocopy.log"
+        win_log = _win_path(wslpath, log)
+        for d in src_dirs:
+            win_src = _win_path(wslpath, mod_root / d)
+            win_dst = _win_path(wslpath, dst / d)
+            excludes = ["*.md"]
+            if d == ".metadata":
+                # Full path, so only the top-level file is excluded; a bare
+                # name would also skip same-named files in subdirectories.
+                excludes.append(win_src + "\\metadata.json")
+            cmd = [
+                robocopy, win_src, win_dst, "/MIR", "/XF", *excludes,
+                "/R:1", "/W:1", "/MT:8", "/NJH", "/NJS", "/NP", "/NS",
+                "/NDL", "/FP", f"/UNILOG:{win_log}",
+            ]
+            result = subprocess.run(cmd, capture_output=True)
+            text = log.read_text(encoding="utf-16") if log.exists() else ""
+            # robocopy exit codes below 8 are success bitmasks.
+            if result.returncode >= 8:
+                print(f"  ERROR: robocopy failed on {d} (exit {result.returncode})")
+                for line in text.splitlines()[-10:]:
+                    print(f"    {line.strip()}")
+                return None
+            for line in text.splitlines():
+                fields = [f.strip() for f in line.split("\t") if f.strip()]
+                if len(fields) < 2:
+                    continue
+                kind, path = fields[0], fields[-1]
+                base = win_dst if kind.startswith("*EXTRA") else win_src
+                if not path.lower().startswith(base.lower()):
+                    continue
+                rel = d + path[len(base):].replace("\\", "/")
+                (removed if kind.startswith("*EXTRA") else changed).append(rel)
+
+    # /XF also shields matching destination files from /MIR's purge, so
+    # stray .md files in the deployed copy are removed here instead.
+    for d in src_dirs:
+        for dirpath, _, filenames in os.walk(dst / d):
+            for f in filenames:
+                if Path(f).suffix.lower() in SKIP_EXTENSIONS:
+                    full = Path(dirpath) / f
+                    full.unlink()
+                    removed.append(full.relative_to(dst).as_posix())
+    return changed, removed
+
+
+def deploy_metadata(mod_root, dst):
+    """Write metadata.json with " (Dev)" stripped, only when it differs."""
+    src_file = mod_root / METADATA_REL
+    if not src_file.exists():
+        return None, False
+    raw = src_file.read_bytes()
+    meta = json.loads(raw.decode("utf-8-sig"))
+    if "(Dev)" in meta.get("name", ""):
+        meta["name"] = meta["name"].replace(" (Dev)", "")
+        raw = (json.dumps(meta, indent=4) + "\n").encode("utf-8-sig")
+    dst_file = dst / METADATA_REL
+    if dst_file.exists() and dst_file.read_bytes() == raw:
+        return meta, False
+    dst_file.parent.mkdir(parents=True, exist_ok=True)
+    dst_file.write_bytes(raw)
+    return meta, True
+
+
+def print_paths(label, paths):
+    print(f"  {label}: {len(paths)}")
+    for rel in sorted(paths)[:LIST_LIMIT]:
+        print(f"    {rel}")
+    if len(paths) > LIST_LIMIT:
+        print(f"    ... and {len(paths) - LIST_LIMIT} more")
+
+
+def deploy(mod_root, skip_lint=False, full=False, excludes=()):
     deploy_root = find_deploy_root(mod_root)
     if not deploy_root:
         print(f"Error: could not find .dev-mods/ ancestor for {mod_root}")
@@ -271,40 +506,43 @@ def deploy(mod_root, skip_lint=False):
             print(f"  Deploy blocked by lint errors. Use --no-lint to skip.")
             return None
 
+    src_dirs = [d for d in MOD_DIRS if (mod_root / d).is_dir()]
+    if not src_dirs:
+        print(f"  WARNING: No game directories found in {mod_root}")
+        return None
+
     fallback_name = mod_root.name.removesuffix(" Development")
     fallback_dst = deploy_root / fallback_name
-    for old_dst in {dst, fallback_dst}:
+    stale_dsts = {fallback_dst} if fallback_dst != dst else set()
+    if full:
+        stale_dsts.add(dst)
+    for old_dst in stale_dsts:
         if old_dst.exists():
             shutil.rmtree(old_dst)
             print(f"  Cleaned: {old_dst.name}/")
 
-    copied = []
-    def _ignore_internal(directory, contents):
-        return [c for c in contents if Path(c).suffix.lower() in SKIP_EXTENSIONS]
+    # robocopy /XF cannot take a long path list, so excludes use the Python sync
+    tools = None if excludes else _robocopy_tools(mod_root, dst)
+    if excludes:
+        print(f"  Excluding: {', '.join(excludes)}")
+    if tools:
+        result = sync_robocopy(mod_root, dst, src_dirs, tools)
+        if result is None:
+            return None
+        changed, removed = result
+    else:
+        changed, removed = sync_python(mod_root, dst, src_dirs, full, excludes)
 
-    for d in MOD_DIRS:
-        src_dir = mod_root / d
-        if src_dir.exists():
-            shutil.copytree(src_dir, dst / d, ignore=_ignore_internal)
-            copied.append(d)
+    meta, meta_written = deploy_metadata(mod_root, dst)
+    if meta_written:
+        changed.append(METADATA_REL)
 
-    if not copied:
-        print(f"  WARNING: No game directories found in {mod_root}")
-        return None
-
-    print(f"  Copied: {', '.join(copied)}")
-
-    meta_file = dst / ".metadata" / "metadata.json"
-    meta = None
-    if meta_file.exists():
-        raw = meta_file.read_text(encoding="utf-8-sig")
-        meta = json.loads(raw)
-        if "(Dev)" in meta.get("name", ""):
-            meta["name"] = meta["name"].replace(" (Dev)", "")
-            meta_file.write_text(
-                json.dumps(meta, indent=4) + "\n", encoding="utf-8-sig"
-            )
-            print(f"  Stripped (Dev) from metadata name")
+    if changed:
+        print_paths("Copied", changed)
+    if removed:
+        print_paths("Removed", removed)
+    if not changed and not removed:
+        print(f"  Up to date")
 
     hook = mod_root / "tools" / "post_deploy.py"
     if hook.exists():
@@ -331,11 +569,29 @@ def main():
         subcommands[args[0]](args[1:])
         return
 
+    excludes, rest = [], []
+    it = iter(args)
+    for a in it:
+        if a in ("--exclude", "--exclude-from"):
+            value = next(it, None)
+            if value is None:
+                print(f"Error: {a} needs a value")
+                sys.exit(1)
+            if a == "--exclude":
+                excludes.append(value)
+            else:
+                lines = Path(value).read_text(encoding="utf-8").splitlines()
+                excludes += [l.strip() for l in lines if l.strip() and not l.lstrip().startswith("#")]
+        else:
+            rest.append(a)
+    args = rest
+
     skip_lint = "--no-lint" in args
-    args = [a for a in args if a != "--no-lint"]
+    full = "--full" in args
+    args = [a for a in args if a not in ("--no-lint", "--full")]
 
     mod_root = resolve_mod_root(args)
-    deploy(mod_root, skip_lint=skip_lint)
+    deploy(mod_root, skip_lint=skip_lint, full=full, excludes=excludes)
 
 
 if __name__ == "__main__":
